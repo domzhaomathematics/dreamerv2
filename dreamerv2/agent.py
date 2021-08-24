@@ -20,8 +20,11 @@ class Agent(common.Module):
       self.step = tf.Variable(int(self._counter), tf.int64)
     self._dataset = dataset
     self.wm = WorldModel(self.step, config)
+    #Generative model, transition and world model
     self._task_behavior = ActorCritic(config, self.step, self._num_act)
+    #Planning, action selection
     reward = lambda f, s, a: self.wm.heads['reward'](f).mode()
+    #function that, given an input, outputs the reward with the reward head in the world_model
     self._expl_behavior = dict(
         greedy=lambda: self._task_behavior,
         random=lambda: expl.Random(actspce),
@@ -68,18 +71,24 @@ class Agent(common.Module):
   def train(self, data, state=None):
     metrics = {}
     state, outputs, mets = self.wm.train(data, state)
+    #One training step with the world model
+    #state,the posterior, dict(embed=embed, feat=feat, post=post,prior=prior, likes=likes, kl=kl_value)
     metrics.update(mets)
+    #update the metrics witht he ones coming from the world model
     start = outputs['post']
     if self.config.pred_discount:  # Last step could be terminal.
       start = tf.nest.map_structure(lambda x: x[:, :-1], start)
     reward = lambda f, s, a: self.wm.heads['reward'](f).mode()
+    #function that, given an input, outputs the reward with the reward head in the world_model
     metrics.update(self._task_behavior.train(self.wm, start, reward))
     if self.config.expl_behavior != 'greedy':
       if self.config.pred_discount:
         data = tf.nest.map_structure(lambda x: x[:, :-1], data)
         outputs = tf.nest.map_structure(lambda x: x[:, :-1], outputs)
       mets = self._expl_behavior.train(start, outputs, data)[-1]
+      #perform one training step for the planner
       metrics.update({'expl_' + key: value for key, value in mets.items()})
+      #update the metrics
     return state, metrics
 
   @tf.function
@@ -93,9 +102,12 @@ class WorldModel(common.Module):
     self.step = step
     self.config = config
     self.rssm = common.RSSM(**config.rssm)
+    #state transition, stores h and computes Z and Z-tilde
     self.heads = {}
     shape = config.image_size + (1 if config.grayscale else 3,)
+    #one or three dimentional depending on if we want color
     self.encoder = common.ConvEncoder(**config.encoder)
+    #Image encoder
     self.heads['image'] = common.ConvDecoder(shape, **config.decoder)
     self.heads['reward'] = common.MLP([], **config.reward_head)
     if config.pred_discount:
@@ -109,47 +121,71 @@ class WorldModel(common.Module):
       model_loss, state, outputs, metrics = self.loss(data, state)
     modules = [self.encoder, self.rssm, *self.heads.values()]
     metrics.update(self.model_opt(model_tape, model_loss, modules))
+    #model_opt in tfutils.py (Optimizer)
+    #perform a gradient step and add grad_norm and loss_scale to metrics
+    #State refers to the posterior distribution here
     return state, outputs, metrics
 
   def loss(self, data, state=None):
     data = self.preprocess(data)
+    #make the image, reward and discount the correct dtype, normalize image
     embed = self.encoder(data)
+    #from the encoder, it takes in the entire obs, only uses image
     post, prior = self.rssm.observe(embed, data['action'], state)
+    #distributions for z and z-tilde, posterior depends on embed, prior just on h
+    # Categorical distribution
     kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
+    #kl between the posterior and prior distribution
     assert len(kl_loss.shape) == 0
     likes = {}
     losses = {'kl': kl_loss}
     feat = self.rssm.get_feat(post)
+    #using z,sampled from the posterior, we can compute the features
+    # the features are used to predict reconstruct obs and reward
     for name, head in self.heads.items():
       grad_head = (name in self.config.grad_heads)
       inp = feat if grad_head else tf.stop_gradient(feat)
       like = tf.cast(head(inp).log_prob(data[name]), tf.float32)
+      #log likelihood for each observation "name", image, reward,etc.
+      #We process in batches so we need to take the mean for each loss
       likes[name] = like
       losses[name] = -like.mean()
     model_loss = sum(
         self.config.loss_scales.get(k, 1.0) * v for k, v in losses.items())
+    #the losses are modulated by a coefficient, hyperparameter in config
     outs = dict(
         embed=embed, feat=feat, post=post,
         prior=prior, likes=likes, kl=kl_value)
     metrics = {f'{name}_loss': value for name, value in losses.items()}
     metrics['model_kl'] = kl_value.mean()
     metrics['prior_ent'] = self.rssm.get_dist(prior).entropy().mean()
+    #entropy is a mesure of uncertainty
     metrics['post_ent'] = self.rssm.get_dist(post).entropy().mean()
+    #entropy is a mesure of uncertainty
+    #uniform distribution is maximum entropy
     return model_loss, post, outs, metrics
 
   def imagine(self, policy, start, horizon):
     flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
     start = {k: flatten(v) for k, v in start.items()}
+    #start is a posterior distribution (first hidden state with observation)
     def step(prev, _):
       state, _, _ = prev
       feat = self.rssm.get_feat(state)
+      #with posterior distribution or prior,we can get the features
       action = policy(tf.stop_gradient(feat)).sample()
+      #get the action, however we do that is independant to the WM
       succ = self.rssm.img_step(state, action)
+      #returns the next prior, that will be use as the state
       return succ, feat, action
     feat = 0 * self.rssm.get_feat(start)
     action = policy(feat).mode()
     succs, feats, actions = common.static_scan(
         step, tf.range(horizon), (start, feat, action))
+    #static scan is in other.py
+    #perform the scan (fn,input,start) fn(start,input) for each input (here it's just the step)
+    #fn should return the same as start
+    #Concatenated states, features, actions, starting from start to the end of the horizon
     states = {k: tf.concat([
         start[k][None], v[:-1]], 0) for k, v in succs.items()}
     if 'discount' in self.heads:
@@ -207,15 +243,21 @@ class ActorCritic(common.Module):
     hor = self.config.imag_horizon
     with tf.GradientTape() as actor_tape:
       feat, state, action, disc = world_model.imagine(self.actor, start, hor)
+      #returns the features, action, states from start to the end of the horizon
+      #----- Actor Critic Specific--------------
       reward = reward_fn(feat, state, action)
       target, weight, mets1 = self.target(feat, action, reward, disc)
       actor_loss, mets2 = self.actor_loss(feat, action, target, weight)
+      #------------------------------------------
+
+     #----- Actor Critic Specific--------------
     with tf.GradientTape() as critic_tape:
       critic_loss, mets3 = self.critic_loss(feat, action, target, weight)
     metrics.update(self.actor_opt(actor_tape, actor_loss, self.actor))
     metrics.update(self.critic_opt(critic_tape, critic_loss, self.critic))
     metrics.update(**mets1, **mets2, **mets3)
     self.update_slow_target()  # Variables exist after first forward pass.
+    #--------------------------------------------
     return metrics
 
   def actor_loss(self, feat, action, target, weight):

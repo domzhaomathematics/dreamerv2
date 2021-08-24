@@ -11,10 +11,14 @@ class Replay:
 
   def __init__(self, directory, limit=None):
     directory.mkdir(parents=True, exist_ok=True)
+    #directory is a path, create all intermediate parent directories if they don't exist
+    #command does nothing if directory already exist
     self._directory = directory
     self._limit = limit
     self._step = sum(int(
         str(n).split('-')[-1][:-4]) - 1 for n in directory.glob('*.npz'))
+        #iterate through all files that end with .npz
+        #check how many time steps for each of these files, sum
     self._episodes = load_episodes(directory, limit)
 
   @property
@@ -32,6 +36,7 @@ class Replay:
   def add(self, episode):
     length = self._length(episode)
     self._step += length
+    #add the number of steps in the episode to the general step counter of buffer
     if self._limit:
       total = 0
       for key, ep in reversed(sorted(
@@ -40,8 +45,12 @@ class Replay:
           total += self._length(ep)
         else:
           del self._episodes[key]
+    #iterate through all the episodes,sorted by x[0], as long as there's room for new episode
+    #delete the rest to make room for this episode
     filename = save_episodes(self._directory, [episode])[0]
+    #save in directory the new episode
     self._episodes[str(filename)] = episode
+    #Add in episode to the buffer
 
   def dataset(self, batch, length, oversample_ends):
     example = self._episodes[next(iter(self._episodes.keys()))]

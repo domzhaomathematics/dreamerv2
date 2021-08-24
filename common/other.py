@@ -17,9 +17,12 @@ class RandomAgent:
   def __init__(self, action_space, logprob=False):
     self._logprob = logprob
     if hasattr(action_space, 'n'):
+      #action space has attribute n? One hot
       self._dist = dists.OneHotDist(tf.zeros(action_space.n))
+      #distribution with straightthrough gradients
     else:
       dist = tfd.Uniform(action_space.low, action_space.high)
+      #continuous actions
       self._dist = tfd.Independent(dist, 1)
 
   def __call__(self, obs, state=None, mode=None):
